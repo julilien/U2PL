@@ -32,7 +32,7 @@ from u2pl.utils.utils import (
 
 parser = argparse.ArgumentParser(description="Semi-Supervised Semantic Segmentation")
 parser.add_argument("--config", type=str, default="config.yaml")
-parser.add_argument("--local_rank", type=int, default=0)
+parser.add_argument("--local-rank", type=int, default=0)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--port", default=None, type=int)
 logger = init_log("global", logging.INFO)
@@ -51,7 +51,9 @@ def main():
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    rank, word_size = setup_distributed(port=args.port)
+    rank, world_size = setup_distributed(port=args.port)
+    # rank = 0
+    # world_size = 1
 
     if rank == 0:
         logger.info("{}".format(pprint.pformat(cfg)))
@@ -84,6 +86,7 @@ def main():
 
     local_rank = int(os.environ["LOCAL_RANK"])
     model = torch.nn.parallel.DistributedDataParallel(
+    # model = torch.nn.DataParallel(
         model,
         device_ids=[local_rank],
         output_device=local_rank,
@@ -205,7 +208,7 @@ def train(
         learning_rates.update(lr[0])
         lr_scheduler.step()
 
-        image, label = data_loader_iter.next()
+        image, label = next(data_loader_iter)
         batch_size, h, w = label.size()
         image, label = image.cuda(), label.cuda()
         outs = model(image)

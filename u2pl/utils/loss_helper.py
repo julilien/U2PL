@@ -48,21 +48,79 @@ def compute_unsupervised_loss(predict, target, percent, pred_teacher):
     return loss
 
 
+def conv_lr_loss(preds, targets, relax_alpha):
+    # Targets must be one-hot encoded
+    with torch.no_grad():
+        sum_y_hat_prime = torch.sum((1. - targets) * preds, dim=-1)
+        y_pred_hat = relax_alpha.unsqueeze(-1) * preds / (sum_y_hat_prime.unsqueeze(-1) + 1e-5)
+        y_target_credal = torch.where(targets > 0.1, torch.ones_like(targets) - relax_alpha.unsqueeze(-1), y_pred_hat)
+
+        y_target_credal = torch.clip(y_target_credal, 1e-5, 1.)
+
+    preds = torch.clip(preds, 1e-5, 1.)
+    divergence = torch.sum(F.kl_div(preds.log(), y_target_credal, log_target=False, reduction="none"), dim=-1)
+
+    preds = torch.sum(preds * targets, dim=-1)
+
+    result = torch.where(torch.gt(preds, 1. - relax_alpha), torch.zeros_like(divergence), divergence)
+    return torch.mean(result)
+
+
+def compute_cssl_loss(pred_student, pred_teacher, h, w, num_classes, temp=1.):
+    pred_student = F.softmax(pred_student, dim=1)
+
+    with torch.no_grad():
+        pseudo_label_w = torch.softmax(pred_teacher.detach() / temp, dim=1)
+
+        _, targets_u_w = torch.max(pseudo_label_w, dim=1)
+        # mask = max_probs.ge(args.threshold).float()
+
+        # Determine p_data and p_model for target normalization
+        guess = pseudo_label_w
+
+        # Determine imprecisiation (alphas)
+        max_probs = torch.max(guess, dim=1).values
+
+        # Set relaxation alpha
+        relax_alpha = torch.maximum(1. - max_probs, torch.ones_like(max_probs) * 1e-3)
+
+    # with torch.no_grad():
+    #     # drop pixels with high entropy
+    #     prob = torch.softmax(pred_teacher, dim=1)
+    #     entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=1)
+
+    # loss = F.cross_entropy(predict, target, ignore_index=255)  # [10, 321, 321]
+
+    # Permute pred_student such that the class dimension is at the end
+    pred_student = pred_student.permute(0, 2, 3, 1)
+    pred_student = pred_student.reshape(-1, h * w, num_classes)
+
+    targets_u_w = targets_u_w.reshape(-1, h * w)
+
+    targets_u_w = F.one_hot(targets_u_w, num_classes=num_classes)
+
+    relax_alpha = relax_alpha.reshape(-1, h * w)
+
+    loss = conv_lr_loss(pred_student, targets_u_w, relax_alpha)
+
+    return loss
+
+
 def compute_contra_memobank_loss(
-    rep,
-    label_l,
-    label_u,
-    prob_l,
-    prob_u,
-    low_mask,
-    high_mask,
-    cfg,
-    memobank,
-    queue_prtlis,
-    queue_size,
-    rep_teacher,
-    momentum_prototype=None,
-    i_iter=0,
+        rep,
+        label_l,
+        label_u,
+        prob_l,
+        prob_u,
+        low_mask,
+        high_mask,
+        cfg,
+        memobank,
+        queue_prtlis,
+        queue_size,
+        rep_teacher,
+        momentum_prototype=None,
+        i_iter=0,
 ):
     # current_class_threshold: delta_p (0.3)
     # current_class_negative_threshold: delta_n (1)
@@ -106,11 +164,11 @@ def compute_contra_memobank_loss(
 
         prob_seg = prob[:, i, :, :]
         rep_mask_low_entropy = (
-            prob_seg > current_class_threshold
-        ) * low_valid_pixel_seg.bool()
+                                       prob_seg > current_class_threshold
+                               ) * low_valid_pixel_seg.bool()
         rep_mask_high_entropy = (
-            prob_seg < current_class_negative_threshold
-        ) * high_valid_pixel_seg.bool()
+                                        prob_seg < current_class_negative_threshold
+                                ) * high_valid_pixel_seg.bool()
 
         seg_feat_all_list.append(rep[low_valid_pixel_seg.bool()])
         seg_feat_low_entropy_list.append(rep[rep_mask_low_entropy])
@@ -154,7 +212,7 @@ def compute_contra_memobank_loss(
             valid_classes.append(i)
 
     if (
-        len(seg_num_list) <= 1
+            len(seg_num_list) <= 1
     ):  # in some rare cases, a small mini-batch might only contain 1 or no semantic class
         if momentum_prototype is None:
             return new_keys, torch.tensor(0.0) * rep.sum()
@@ -172,8 +230,8 @@ def compute_contra_memobank_loss(
 
         for i in range(valid_seg):
             if (
-                len(seg_feat_low_entropy_list[i]) > 0
-                and memobank[valid_classes[i]][0].shape[0] > 0
+                    len(seg_feat_low_entropy_list[i]) > 0
+                    and memobank[valid_classes[i]][0].shape[0] > 0
             ):
                 # select anchor pixel
                 seg_low_entropy_idx = torch.randint(
@@ -210,10 +268,10 @@ def compute_contra_memobank_loss(
                     if not (momentum_prototype == 0).all():
                         ema_decay = min(1 - 1 / i_iter, 0.999)
                         positive_feat = (
-                            1 - ema_decay
-                        ) * positive_feat + ema_decay * momentum_prototype[
-                            valid_classes[i]
-                        ]
+                                                1 - ema_decay
+                                        ) * positive_feat + ema_decay * momentum_prototype[
+                                            valid_classes[i]
+                                        ]
 
                     prototype[valid_classes[i]] = positive_feat.clone()
 
@@ -299,11 +357,11 @@ class Criterion(nn.Module):
             main_h, main_w = main_pred.size(2), main_pred.size(3)
             aux_h, aux_w = aux_pred.size(2), aux_pred.size(3)
             assert (
-                len(preds) == 2
-                and main_h == aux_h
-                and main_w == aux_w
-                and main_h == h
-                and main_w == w
+                    len(preds) == 2
+                    and main_h == aux_h
+                    and main_w == aux_w
+                    and main_h == h
+                    and main_w == w
             )
             if self.use_weight:
                 loss1 = self._criterion(main_pred, target) + self._criterion1(
@@ -322,12 +380,12 @@ class Criterion(nn.Module):
 
 class CriterionOhem(nn.Module):
     def __init__(
-        self,
-        aux_weight,
-        thresh=0.7,
-        min_kept=100000,
-        ignore_index=255,
-        use_weight=False,
+            self,
+            aux_weight,
+            thresh=0.7,
+            min_kept=100000,
+            ignore_index=255,
+            use_weight=False,
     ):
         super(CriterionOhem, self).__init__()
         self._aux_weight = aux_weight
@@ -343,11 +401,11 @@ class CriterionOhem(nn.Module):
             main_h, main_w = main_pred.size(2), main_pred.size(3)
             aux_h, aux_w = aux_pred.size(2), aux_pred.size(3)
             assert (
-                len(preds) == 2
-                and main_h == aux_h
-                and main_w == aux_w
-                and main_h == h
-                and main_w == w
+                    len(preds) == 2
+                    and main_h == aux_h
+                    and main_w == aux_w
+                    and main_h == h
+                    and main_w == w
             )
 
             loss1 = self._criterion1(main_pred, target)
@@ -377,7 +435,7 @@ class OhemCrossEntropy2d(nn.Module):
 
         n, c, h, w = predict.shape
         min_kept = self.min_kept // (
-            factor * factor
+                factor * factor
         )  # int(self.min_kept_ratio * n * h * w)
 
         input_label = target.ravel().astype(np.int32)
@@ -454,7 +512,7 @@ class OhemCrossEntropy2dTensor(nn.Module):
     """
 
     def __init__(
-        self, ignore_index=255, thresh=0.7, min_kept=256, use_weight=False, reduce=False
+            self, ignore_index=255, thresh=0.7, min_kept=256, use_weight=False, reduce=False
     ):
         super(OhemCrossEntropy2dTensor, self).__init__()
         self.ignore_index = ignore_index

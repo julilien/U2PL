@@ -16,7 +16,7 @@ dataset: # Required.
     crop:
       type: center
       size: [513, 513] # crop image with HxW size
-  batch_size: 4
+  batch_size: 3
   n_sup: 1464
   noise_std: 0.1
   workers: 2
@@ -25,12 +25,12 @@ dataset: # Required.
   ignore_label: 255
 
 trainer: # Required.
-  epochs: 80
+  epochs: 50 # 80
   eval_on: True
   optimizer:
     type: SGD
     kwargs:
-      lr: 0.001  # 4GPUs
+      lr: 0.005 # 0.001  # 4GPUs
       momentum: 0.9
       weight_decay: 0.0001
   lr_scheduler:
@@ -67,7 +67,7 @@ net: # Required.
   sync_bn: True
   ema_decay: 0.99
   encoder:
-    type: u2pl.models.resnet.resnet101
+    type: u2pl.models.resnet.resnet50 # u2pl.models.resnet.resnet101
     kwargs:
       multi_grid: True
       zero_init_residual: True

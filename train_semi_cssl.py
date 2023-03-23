@@ -23,7 +23,7 @@ from u2pl.utils.dist_helper import setup_distributed
 from u2pl.utils.loss_helper import (
     compute_contra_memobank_loss,
     compute_unsupervised_loss,
-    get_criterion,
+    get_criterion, compute_cssl_loss,
 )
 from u2pl.utils.lr_helper import get_optimizer, get_scheduler
 from u2pl.utils.utils import (
@@ -45,7 +45,7 @@ parser.add_argument("--port", default=None, type=int)
 
 
 def main():
-    global args, cfg, prototype
+    global args, cfg # , prototype
     args = parser.parse_args()
     seed = args.seed
     cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
@@ -168,15 +168,15 @@ def main():
         queue_ptrlis.append(torch.zeros(1, dtype=torch.long))
     queue_size[0] = 50000
 
-    # build prototype
-    prototype = torch.zeros(
-        (
-            cfg["net"]["num_classes"],
-            cfg["trainer"]["contrastive"]["num_queries"],
-            1,
-            256,
-        )
-    ).cuda()
+    # # build prototype
+    # prototype = torch.zeros(
+    #     (
+    #         cfg["net"]["num_classes"],
+    #         cfg["trainer"]["contrastive"]["num_queries"],
+    #         1,
+    #         256,
+    #     )
+    # ).cuda()
 
     # Start to train model
     for epoch in range(last_epoch, cfg_trainer["epochs"]):
@@ -246,7 +246,7 @@ def train(
     queue_ptrlis,
     queue_size,
 ):
-    global prototype
+    # global prototype
     ema_decay_origin = cfg["net"]["ema_decay"]
 
     model.train()
@@ -263,7 +263,7 @@ def train(
 
     sup_losses = AverageMeter(10)
     uns_losses = AverageMeter(10)
-    con_losses = AverageMeter(10)
+    # con_losses = AverageMeter(10)
     data_times = AverageMeter(10)
     batch_times = AverageMeter(10)
     learning_rates = AverageMeter(10)
@@ -286,7 +286,6 @@ def train(
         image_u = image_u.cuda()
 
         if epoch < cfg["trainer"].get("sup_only_epoch", 1):
-            contra_flag = "none"
             # forward
             outs = model(image_l)
             pred, rep = outs["pred"], outs["rep"]
@@ -374,152 +373,146 @@ def train(
                 )
 
             # unsupervised loss
-            drop_percent = cfg["trainer"]["unsupervised"].get("drop_percent", 100)
-            percent_unreliable = (100 - drop_percent) * (1 - epoch / cfg["trainer"]["epochs"])
-            drop_percent = 100 - percent_unreliable
-            unsup_loss = (
-                    compute_unsupervised_loss(
-                        pred_u_large,
-                        label_u_aug.clone(),
-                        drop_percent,
-                        pred_u_large_teacher.detach(),
-                    )
+            # drop_percent = cfg["trainer"]["unsupervised"].get("drop_percent", 100)
+            # percent_unreliable = (100 - drop_percent) * (1 - epoch / cfg["trainer"]["epochs"])
+            # drop_percent = 100 - percent_unreliable
+            unsup_loss = (compute_cssl_loss(pred_u_large, pred_u_large_teacher, h, w, cfg["net"]["num_classes"])
                     * cfg["trainer"]["unsupervised"].get("loss_weight", 1)
             )
 
-            # contrastive loss using unreliable pseudo labels
-            contra_flag = "none"
-            if cfg["trainer"].get("contrastive", False):
-                cfg_contra = cfg["trainer"]["contrastive"]
-                contra_flag = "{}:{}".format(
-                    cfg_contra["low_rank"], cfg_contra["high_rank"]
-                )
-                alpha_t = cfg_contra["low_entropy_threshold"] * (
-                    1 - epoch / cfg["trainer"]["epochs"]
-                )
-
-                with torch.no_grad():
-                    prob = torch.softmax(pred_u_large_teacher, dim=1)
-                    entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=1)
-
-                    low_thresh = np.percentile(
-                        entropy[label_u_aug != 255].cpu().numpy().flatten(), alpha_t
-                    )
-                    low_entropy_mask = (
-                        entropy.le(low_thresh).float() * (label_u_aug != 255).bool()
-                    )
-
-                    high_thresh = np.percentile(
-                        entropy[label_u_aug != 255].cpu().numpy().flatten(),
-                        100 - alpha_t,
-                    )
-                    high_entropy_mask = (
-                        entropy.ge(high_thresh).float() * (label_u_aug != 255).bool()
-                    )
-
-                    low_mask_all = torch.cat(
-                        (
-                            (label_l.unsqueeze(1) != 255).float(),
-                            low_entropy_mask.unsqueeze(1),
-                        )
-                    )
-
-                    low_mask_all = F.interpolate(
-                        low_mask_all, size=pred_all.shape[2:], mode="nearest"
-                    )
-                    # down sample
-
-                    if cfg_contra.get("negative_high_entropy", True):
-                        contra_flag += " high"
-                        high_mask_all = torch.cat(
-                            (
-                                (label_l.unsqueeze(1) != 255).float(),
-                                high_entropy_mask.unsqueeze(1),
-                            )
-                        )
-                    else:
-                        contra_flag += " low"
-                        high_mask_all = torch.cat(
-                            (
-                                (label_l.unsqueeze(1) != 255).float(),
-                                torch.ones(logits_u_aug.shape)
-                                .float()
-                                .unsqueeze(1)
-                                .cuda(),
-                            ),
-                        )
-                    high_mask_all = F.interpolate(
-                        high_mask_all, size=pred_all.shape[2:], mode="nearest"
-                    )  # down sample
-
-                    # down sample and concat
-                    label_l_small = F.interpolate(
-                        label_onehot(label_l, cfg["net"]["num_classes"]),
-                        size=pred_all.shape[2:],
-                        mode="nearest",
-                    )
-                    label_u_small = F.interpolate(
-                        label_onehot(label_u_aug, cfg["net"]["num_classes"]),
-                        size=pred_all.shape[2:],
-                        mode="nearest",
-                    )
-
-                if cfg_contra.get("binary", False):
-                    contra_flag += " BCE"
-                    contra_loss = compute_binary_memobank_loss(
-                        rep_all,
-                        torch.cat((label_l_small, label_u_small)).long(),
-                        low_mask_all,
-                        high_mask_all,
-                        prob_all_teacher.detach(),
-                        cfg_contra,
-                        memobank,
-                        queue_ptrlis,
-                        queue_size,
-                        rep_all_teacher.detach(),
-                    )
-                else:
-                    if not cfg_contra.get("anchor_ema", False):
-                        new_keys, contra_loss = compute_contra_memobank_loss(
-                            rep_all,
-                            label_l_small.long(),
-                            label_u_small.long(),
-                            prob_l_teacher.detach(),
-                            prob_u_teacher.detach(),
-                            low_mask_all,
-                            high_mask_all,
-                            cfg_contra,
-                            memobank,
-                            queue_ptrlis,
-                            queue_size,
-                            rep_all_teacher.detach(),
-                        )
-                    else:
-                        prototype, new_keys, contra_loss = compute_contra_memobank_loss(
-                            rep_all,
-                            label_l_small.long(),
-                            label_u_small.long(),
-                            prob_l_teacher.detach(),
-                            prob_u_teacher.detach(),
-                            low_mask_all,
-                            high_mask_all,
-                            cfg_contra,
-                            memobank,
-                            queue_ptrlis,
-                            queue_size,
-                            rep_all_teacher.detach(),
-                            prototype,
-                        )
-
-                dist.all_reduce(contra_loss)
-                contra_loss = (
-                    contra_loss
-                    / world_size
-                    * cfg["trainer"]["contrastive"].get("loss_weight", 1)
-                )
-
-            else:
-                contra_loss = 0 * rep_all.sum()
+            # # contrastive loss using unreliable pseudo labels
+            # contra_flag = "none"
+            # if cfg["trainer"].get("contrastive", False):
+            #     cfg_contra = cfg["trainer"]["contrastive"]
+            #     contra_flag = "{}:{}".format(
+            #         cfg_contra["low_rank"], cfg_contra["high_rank"]
+            #     )
+            #     alpha_t = cfg_contra["low_entropy_threshold"] * (
+            #         1 - epoch / cfg["trainer"]["epochs"]
+            #     )
+            #
+            #     with torch.no_grad():
+            #         prob = torch.softmax(pred_u_large_teacher, dim=1)
+            #         entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=1)
+            #
+            #         low_thresh = np.percentile(
+            #             entropy[label_u_aug != 255].cpu().numpy().flatten(), alpha_t
+            #         )
+            #         low_entropy_mask = (
+            #             entropy.le(low_thresh).float() * (label_u_aug != 255).bool()
+            #         )
+            #
+            #         high_thresh = np.percentile(
+            #             entropy[label_u_aug != 255].cpu().numpy().flatten(),
+            #             100 - alpha_t,
+            #         )
+            #         high_entropy_mask = (
+            #             entropy.ge(high_thresh).float() * (label_u_aug != 255).bool()
+            #         )
+            #
+            #         low_mask_all = torch.cat(
+            #             (
+            #                 (label_l.unsqueeze(1) != 255).float(),
+            #                 low_entropy_mask.unsqueeze(1),
+            #             )
+            #         )
+            #
+            #         low_mask_all = F.interpolate(
+            #             low_mask_all, size=pred_all.shape[2:], mode="nearest"
+            #         )
+            #         # down sample
+            #
+            #         if cfg_contra.get("negative_high_entropy", True):
+            #             contra_flag += " high"
+            #             high_mask_all = torch.cat(
+            #                 (
+            #                     (label_l.unsqueeze(1) != 255).float(),
+            #                     high_entropy_mask.unsqueeze(1),
+            #                 )
+            #             )
+            #         else:
+            #             contra_flag += " low"
+            #             high_mask_all = torch.cat(
+            #                 (
+            #                     (label_l.unsqueeze(1) != 255).float(),
+            #                     torch.ones(logits_u_aug.shape)
+            #                     .float()
+            #                     .unsqueeze(1)
+            #                     .cuda(),
+            #                 ),
+            #             )
+            #         high_mask_all = F.interpolate(
+            #             high_mask_all, size=pred_all.shape[2:], mode="nearest"
+            #         )  # down sample
+            #
+            #         # down sample and concat
+            #         label_l_small = F.interpolate(
+            #             label_onehot(label_l, cfg["net"]["num_classes"]),
+            #             size=pred_all.shape[2:],
+            #             mode="nearest",
+            #         )
+            #         label_u_small = F.interpolate(
+            #             label_onehot(label_u_aug, cfg["net"]["num_classes"]),
+            #             size=pred_all.shape[2:],
+            #             mode="nearest",
+            #         )
+            #
+            #     if cfg_contra.get("binary", False):
+            #         contra_flag += " BCE"
+            #         contra_loss = compute_binary_memobank_loss(
+            #             rep_all,
+            #             torch.cat((label_l_small, label_u_small)).long(),
+            #             low_mask_all,
+            #             high_mask_all,
+            #             prob_all_teacher.detach(),
+            #             cfg_contra,
+            #             memobank,
+            #             queue_ptrlis,
+            #             queue_size,
+            #             rep_all_teacher.detach(),
+            #         )
+            #     else:
+            #         if not cfg_contra.get("anchor_ema", False):
+            #             new_keys, contra_loss = compute_contra_memobank_loss(
+            #                 rep_all,
+            #                 label_l_small.long(),
+            #                 label_u_small.long(),
+            #                 prob_l_teacher.detach(),
+            #                 prob_u_teacher.detach(),
+            #                 low_mask_all,
+            #                 high_mask_all,
+            #                 cfg_contra,
+            #                 memobank,
+            #                 queue_ptrlis,
+            #                 queue_size,
+            #                 rep_all_teacher.detach(),
+            #             )
+            #         else:
+            #             prototype, new_keys, contra_loss = compute_contra_memobank_loss(
+            #                 rep_all,
+            #                 label_l_small.long(),
+            #                 label_u_small.long(),
+            #                 prob_l_teacher.detach(),
+            #                 prob_u_teacher.detach(),
+            #                 low_mask_all,
+            #                 high_mask_all,
+            #                 cfg_contra,
+            #                 memobank,
+            #                 queue_ptrlis,
+            #                 queue_size,
+            #                 rep_all_teacher.detach(),
+            #                 prototype,
+            #             )
+            #
+            #     dist.all_reduce(contra_loss)
+            #     contra_loss = (
+            #         contra_loss
+            #         / world_size
+            #         * cfg["trainer"]["contrastive"].get("loss_weight", 1)
+            #     )
+            #
+            # else:
+            contra_loss = 0 * rep_all.sum()
 
         loss = sup_loss + unsup_loss + contra_loss
 
@@ -556,32 +549,29 @@ def train(
         dist.all_reduce(reduced_uns_loss)
         uns_losses.update(reduced_uns_loss.item())
 
-        reduced_con_loss = contra_loss.clone().detach()
-        dist.all_reduce(reduced_con_loss)
-        con_losses.update(reduced_con_loss.item())
+        # reduced_con_loss = contra_loss.clone().detach()
+        # dist.all_reduce(reduced_con_loss)
+        # con_losses.update(reduced_con_loss.item())
 
         batch_end = time.time()
         batch_times.update(batch_end - batch_start)
 
         if i_iter % 10 == 0 and rank == 0:
             logger.info(
-                "[{}][{}] "
+                "[{}] "
                 "Iter [{}/{}]\t"
                 "Data {data_time.val:.2f} ({data_time.avg:.2f})\t"
                 "Time {batch_time.val:.2f} ({batch_time.avg:.2f})\t"
                 "Sup {sup_loss.val:.3f} ({sup_loss.avg:.3f})\t"
                 "Uns {uns_loss.val:.3f} ({uns_loss.avg:.3f})\t"
-                "Con {con_loss.val:.3f} ({con_loss.avg:.3f})\t"
                 "LR {lr.val:.5f}".format(
                     cfg["dataset"]["n_sup"],
-                    contra_flag,
                     i_iter,
                     cfg["trainer"]["epochs"] * len(loader_l),
                     data_time=data_times,
                     batch_time=batch_times,
                     sup_loss=sup_losses,
                     uns_loss=uns_losses,
-                    con_loss=con_losses,
                     lr=learning_rates,
                 )
             )
@@ -589,7 +579,7 @@ def train(
             tb_logger.add_scalar("lr", learning_rates.val, i_iter)
             tb_logger.add_scalar("Sup Loss", sup_losses.val, i_iter)
             tb_logger.add_scalar("Uns Loss", uns_losses.val, i_iter)
-            tb_logger.add_scalar("Con Loss", con_losses.val, i_iter)
+            # tb_logger.add_scalar("Con Loss", con_losses.val, i_iter)
 
 
 def validate(
